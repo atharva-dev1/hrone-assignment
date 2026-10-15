@@ -43,7 +43,8 @@ class TestEmployees:
             "emp_code": "EMP1002",
             "name": "Duplicate Test",
             "email": "dup@example.com",
-            "department": "Engineering"
+            "department": "Engineering",
+            "joined_on": "2026-01-01"
         }
         test_client.post("/employees", json=emp_data)
         response = test_client.post("/employees", json=emp_data)
@@ -113,10 +114,14 @@ class TestPunchOut:
     
     def test_punch_out_success(self, test_client, seeded_db):
         """Test successful punch-out."""
-        punch_in_data = {"emp_code": "EMP0006"}
+        # First punch in for EMP0006
+        import time
+        now_ms = int(time.time() * 1000)
+        punch_in_data = {"emp_code": "EMP0006", "punched_at": now_ms}
         test_client.post("/attendance/punch-in", json=punch_in_data)
         
-        punch_out_data = {"emp_code": "EMP0006"}
+        # Punch out within a reasonable time
+        punch_out_data = {"emp_code": "EMP0006", "punched_at": now_ms + 3600000}  # 1 hour later
         response = test_client.post("/attendance/punch-out", json=punch_out_data)
         assert response.status_code == 200
         data = response.json()
@@ -185,6 +190,7 @@ class TestRegularizeAttendance:
             "reason": "Test",
             "regularized_by": "hr.admin"
         }
+        # Use a valid emp_code pattern that doesn't exist
         response = test_client.patch("/attendance/EMP9999/2026-07-06", json=regularize_data)
         assert response.status_code == 404
     

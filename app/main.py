@@ -8,12 +8,14 @@ This file implements all endpoints according to the OpenAPI contract and busines
 """
 import os
 import re
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from bson import json_util
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING, TEXT
@@ -153,6 +155,14 @@ class EmployeeCreate(BaseModel):
     shift_end: str = "18:30"
     joined_on: str
 
+    @field_validator('emp_code')
+    @classmethod
+    def validate_emp_code(cls, v):
+        # emp_code: EMP followed by 4-6 digits
+        if not re.match(r'^EMP\d{4,6}$', v):
+            raise ValueError('emp_code must match pattern EMP followed by 4-6 digits')
+        return v
+
 
 class PunchInRequest(BaseModel):
     emp_code: str
@@ -176,18 +186,19 @@ class RegularizeRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 # Startup - Create Indexes
 # --------------------------------------------------------------------------- #
-@app.on_event("startup")
-async def create_indexes():
-    """Create MongoDB indexes at startup."""
+def create_indexes_sync():
+    """Create MongoDB indexes at startup (synchronous version)."""
     # Employees: unique on emp_code
     db.employees.create_index([("emp_code", ASCENDING)], unique=True)
     
     # Attendance: compound for common queries
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
-    db.attendance_logs.create_index([("date", ASCENDING), ("emp_code", ASCENDING)])
-    db.attendance_logs.create_index([("emp_code", ASCENDING)])
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
     
     print("MongoDB indexes created successfully.")
+
+
+app.router.on_startup.append(create_indexes_sync)
 
 
 # --------------------------------------------------------------------------- #
@@ -385,7 +396,7 @@ def punch_out(body: PunchOutRequest):
         "status": {"$in": ["PRESENT", "WFH", "ON_DUTY"]},
         "punch_in": {"$lte": punched_at_dt},
         "punch_out": None
-    })
+    }, sort=[("punch_in", DESCENDING)])
     
     if record is None:
         raise HTTPException(status_code=404, detail="No punch-in found to punch out")
@@ -414,11 +425,14 @@ def punch_out(body: PunchOutRequest):
     }
     
     result = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"]},
+        {"_id": record["_id"], "punch_out": None},
         {"$set": update_doc},
         return_document=True
     )
-    
+
+    if result is None:
+        raise HTTPException(status_code=409, detail="Attendance record was already punched out")
+
     return attendance_to_dict(result)
 
 
@@ -475,17 +489,18 @@ def list_attendance(
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     """Manually correct an attendance record with audit trail."""
+    # Resolve the resource before validating correction-specific fields so a
+    # missing employee consistently returns 404.
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
     # Validate reason length
     if len(body.reason) < 5 or len(body.reason) > 200:
         raise HTTPException(status_code=422, detail="Reason must be 5-200 characters")
     
     if len(body.regularized_by) < 1 or len(body.regularized_by) > 50:
         raise HTTPException(status_code=422, detail="regularized_by must be 1-50 characters")
-    
-    # Find employee
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if emp is None:
-        raise HTTPException(status_code=404, detail="Employee not found")
     
     # Find record
     record = db.attendance_logs.find_one({
@@ -906,15 +921,21 @@ def late_leaderboard(month: str, limit: int = 10, department: Optional[str] = No
 
 
 @app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, from_date: str, to_date: str):
+def department_trend(
+    department: str,
+    from_param: str = Query(..., alias="from"),
+    to_param: str = Query(..., alias="to")
+):
     """Daily attendance trend for a department with gap-filling."""
-    # Validate date range
-    if from_date > to_date:
-        raise HTTPException(status_code=422, detail="from_date cannot be after to_date")
-    
-    # Check date range is not more than 92 days
-    start = datetime.strptime(from_date, "%Y-%m-%d")
-    end = datetime.strptime(to_date, "%Y-%m-%d")
+    try:
+        start = datetime.strptime(from_param, "%Y-%m-%d")
+        end = datetime.strptime(to_param, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="from and to must be YYYY-MM-DD dates") from exc
+
+    if start > end:
+        raise HTTPException(status_code=422, detail="from cannot be after to")
+
     if (end - start).days > 92:
         raise HTTPException(status_code=422, detail="Date range cannot exceed 92 days")
     
@@ -943,7 +964,7 @@ def department_trend(department: str, from_date: str, to_date: str):
     stats_pipeline = [
         {"$match": {
             "emp_code": {"$in": list(db.employees.distinct("emp_code", {"department": department}))},
-            "date": {"$gte": from_date, "$lte": to_date}
+            "date": {"$gte": from_param, "$lte": to_param}
         }},
         {"$group": {
             "_id": "$date",
@@ -1022,8 +1043,8 @@ def explain_endpoint(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     status: Optional[str] = None,
-    from_date: Optional[str] = None,
-    to_date: Optional[str] = None,
+    from_param: Optional[str] = Query(None, alias="from"),
+    to_param: Optional[str] = Query(None, alias="to"),
     page: int = 1,
     page_size: int = 20
 ):
@@ -1032,7 +1053,7 @@ def explain_endpoint(
     if endpoint == "employee_monthly":
         if not month:
             raise HTTPException(status_code=422, detail="month parameter is required")
-        return explain_employee_monthly(month)
+        return explain_employee_monthly(month, emp_code)
     elif endpoint == "department_summary":
         if not month:
             raise HTTPException(status_code=422, detail="month parameter is required")
@@ -1042,16 +1063,34 @@ def explain_endpoint(
             raise HTTPException(status_code=422, detail="month parameter is required")
         return explain_late_leaderboard(month, department)
     elif endpoint == "department_trend":
-        if not department or not from_date or not to_date:
+        if not department or not from_param or not to_param:
             raise HTTPException(status_code=422, detail="department, from, and to parameters are required")
-        return explain_department_trend(department, from_date, to_date)
+        return explain_department_trend(department, from_param, to_param)
     elif endpoint == "attendance_list":
         return explain_attendance_list(emp_code, date_from, date_to, status, page, page_size)
     else:
         raise HTTPException(status_code=422, detail=f"Unknown endpoint: {endpoint}")
 
 
-def explain_employee_monthly(month: str):
+def _make_jsonable(obj):
+    """Convert MongoDB explain output to JSON-serializable format."""
+    return json.loads(json_util.dumps(obj))
+
+
+def _explain_command(collection: str, pipeline: list[dict]):
+    """Run an aggregate command through MongoDB's explain command."""
+    return db.command(
+        "explain",
+        {
+            "aggregate": collection,
+            "pipeline": pipeline,
+            "cursor": {}
+        },
+        verbosity="executionStats"
+    )
+
+
+def explain_employee_monthly(month: str, emp_code: Optional[str] = None):
     """Explain employee monthly query."""
     year, month_num = int(month[:4]), int(month[5:7])
     
@@ -1061,8 +1100,11 @@ def explain_employee_monthly(month: str):
         next_month = datetime(year, month_num + 1, 1) if month_num < 12 else datetime(year + 1, 1, 1)
         last_day = (next_month - timedelta(days=1)).strftime("%Y-%m-%d")
     
+    match = {"date": {"$gte": f"{year:04d}-{month_num:02d}-01", "$lte": last_day}}
+    if emp_code:
+        match["emp_code"] = emp_code
     pipeline = [
-        {"$match": {"date": {"$gte": f"{year:04d}-{month_num:02d}-01", "$lte": last_day}}},
+        {"$match": match},
         {"$group": {
             "_id": "$emp_code",
             "total_late_minutes": {"$sum": "$late_minutes"},
@@ -1070,12 +1112,12 @@ def explain_employee_monthly(month: str):
         }}
     ]
     
-    explain = db.attendance_logs.explain("aggregate", pipeline, verbosity="executionStats")
+    explain = _explain_command("attendance_logs", pipeline)
     
     return {
         "endpoint": "employee_monthly",
         "collection": "attendance_logs",
-        "explain": explain
+        "explain": _make_jsonable(explain)
     }
 
 
@@ -1112,12 +1154,12 @@ def explain_department_summary(month: str, department: Optional[str] = None):
         }
     })
     
-    explain = db.employees.explain("aggregate", pipeline, verbosity="executionStats")
+    explain = _explain_command("employees", pipeline)
     
     return {
         "endpoint": "department_summary",
         "collection": "employees",
-        "explain": explain
+        "explain": _make_jsonable(explain)
     }
 
 
@@ -1142,12 +1184,12 @@ def explain_late_leaderboard(month: str, department: Optional[str] = None):
         {"$sort": {"total_late_minutes": DESCENDING}}
     ]
     
-    explain = db.attendance_logs.explain("aggregate", pipeline, verbosity="executionStats")
+    explain = _explain_command("attendance_logs", pipeline)
     
     return {
         "endpoint": "late_leaderboard",
         "collection": "attendance_logs",
-        "explain": explain
+        "explain": _make_jsonable(explain)
     }
 
 
@@ -1165,12 +1207,12 @@ def explain_department_trend(department: str, from_date: str, to_date: str):
         emp_codes = list(db.employees.distinct("emp_code", {"department": department}))
         pipeline[0]["$match"]["emp_code"] = {"$in": emp_codes}
     
-    explain = db.attendance_logs.explain("aggregate", pipeline, verbosity="executionStats")
+    explain = _explain_command("attendance_logs", pipeline)
     
     return {
         "endpoint": "department_trend",
         "collection": "attendance_logs",
-        "explain": explain
+        "explain": _make_jsonable(explain)
     }
 
 
@@ -1191,20 +1233,22 @@ def explain_attendance_list(emp_code: Optional[str] = None, date_from: Optional[
         if date_to:
             q["date"]["$lte"] = date_to
     
-    # Build explain query
-    explain = db.attendance_logs.explain(
-        "find",
-        q,
-        sort=[("date", DESCENDING), ("emp_code", ASCENDING)],
-        skip=(page - 1) * page_size,
-        limit=page_size,
+    explain = db.command(
+        "explain",
+        {
+            "find": "attendance_logs",
+            "filter": q,
+            "sort": {"date": -1, "emp_code": 1},
+            "skip": (page - 1) * page_size,
+            "limit": page_size
+        },
         verbosity="executionStats"
     )
     
     return {
         "endpoint": "attendance_list",
         "collection": "attendance_logs",
-        "explain": explain
+        "explain": _make_jsonable(explain)
     }
 
 
